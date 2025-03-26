@@ -1,0 +1,105 @@
+2. DaemonSet for Node Exporter
+A minimal DaemonSet specification might look like:
+
+yaml
+Copy
+Edit
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: custom-node-exporter
+  namespace: my-user-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: custom-node-exporter
+  template:
+    metadata:
+      labels:
+        app: custom-node-exporter
+    spec:
+      hostNetwork: true
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:latest
+          ports:
+            - containerPort: 9100
+          securityContext:
+            privileged: true  # needed to read host-level metrics
+      # If your cluster requires a SecurityContextConstraints (SCC) change,
+      # you may need to grant this DS permission to run privileged pods.
+Notes:
+
+Privileged: Node Exporter typically requires privileged access to read host filesystems, CPU info, etc.
+
+hostNetwork: So it can bind to :9100 for each node.
+
+You might need an appropriate SCC or cluster-role binding if the default policies do not allow privileged DaemonSets in that namespace.
+
+3. Service & ServiceMonitor
+Service:
+
+yaml
+Copy
+Edit
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-node-exporter-service
+  namespace: my-user-monitoring
+  labels:
+    app: custom-node-exporter
+spec:
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100
+  selector:
+    app: custom-node-exporter
+ServiceMonitor (so your user-workload Prometheus can discover & scrape it):
+
+yaml
+Copy
+Edit
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: custom-node-exporter-sm
+  namespace: my-user-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: custom-node-exporter
+  endpoints:
+    - port: metrics
+      interval: 30s
+  namespaceSelector:
+    matchNames:
+      - my-user-monitoring
+Key Points:
+
+The selector under spec.selector.matchLabels must match the labels on the Service (and in turn, the DaemonSet pods).
+
+The user-workload Prometheus typically scrapes any ServiceMonitor in any user namespace (unless restricted). If you place it in the same namespace as the DaemonSet, everything is straightforward.
+
+4. Remote Write to Central Cluster
+Once user-workload Prometheus is scraping the custom Node Exporter, you can remote write those metrics to your central Prometheus (or Observability cluster) by adding a remoteWrite: section to the user-workload-monitoring-config in openshift-user-workload-monitoring. For example:
+
+yaml
+Copy
+Edit
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-workload-monitoring-config
+  namespace: openshift-user-workload-monitoring
+data:
+  config.yaml: |
+    prometheus:
+      remoteWrite:
+        - url: "https://central-prom.example.com/api/v1/write"
+          bearer_token: "mySecret"
