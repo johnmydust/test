@@ -1,105 +1,125 @@
-2. DaemonSet for Node Exporter
-A minimal DaemonSet specification might look like:
+Here's how the files can be structured and populated:
 
-yaml
-Copy
-Edit
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: custom-node-exporter
-  namespace: my-user-monitoring
-spec:
-  selector:
-    matchLabels:
-      app: custom-node-exporter
-  template:
-    metadata:
-      labels:
-        app: custom-node-exporter
-    spec:
-      hostNetwork: true
-      tolerations:
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: node-exporter
-          image: quay.io/prometheus/node-exporter:latest
-          ports:
-            - containerPort: 9100
-          securityContext:
-            privileged: true  # needed to read host-level metrics
-      # If your cluster requires a SecurityContextConstraints (SCC) change,
-      # you may need to grant this DS permission to run privileged pods.
-Notes:
+defaults/main.yaml
 
-Privileged: Node Exporter typically requires privileged access to read host filesystems, CPU info, etc.
+monitoring_namespace: user-monitoring
 
-hostNetwork: So it can bind to :9100 for each node.
+remote_write:
+  url: "https://your-remote-prometheus/api/v1/write"
+  username: "your_username"
+  password: "your_password"
 
-You might need an appropriate SCC or cluster-role binding if the default policies do not allow privileged DaemonSets in that namespace.
+tasks/main.yaml
 
-3. Service & ServiceMonitor
-Service:
+- name: Configure User Monitoring Stack
+  include_tasks: "{{ item }}"
+  loop:
+    - namespace.yaml
+    - kube_state_metrics.yaml
+    - node_exporter.yaml
+    - prometheus.yaml
+    - servicemonitors.yaml
 
-yaml
-Copy
-Edit
-apiVersion: v1
-kind: Service
-metadata:
-  name: custom-node-exporter-service
-  namespace: my-user-monitoring
-  labels:
-    app: custom-node-exporter
-spec:
-  ports:
-    - name: metrics
-      port: 9100
-      targetPort: 9100
-  selector:
-    app: custom-node-exporter
-ServiceMonitor (so your user-workload Prometheus can discover & scrape it):
+tasks/namespace.yaml
 
-yaml
-Copy
-Edit
+- name: Create monitoring namespace
+  k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ monitoring_namespace }}"
+    state: present
+
+tasks/kube_state_metrics.yaml
+
+- name: Deploy kube-state-metrics
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    src: https://github.com/kubernetes/kube-state-metrics/releases/latest/download/kube-state-metrics.yaml
+
+tasks/node_exporter.yaml
+
+- name: Deploy Node Exporter DaemonSet
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    definition: "{{ lookup('url', 'https://raw.githubusercontent.com/prometheus/node_exporter/master/examples/kubernetes/node-exporter-daemonset.yml', split_lines=False) }}"
+
+tasks/prometheus.yaml
+
+- name: Deploy Prometheus instance
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    definition: "{{ lookup('template', 'prometheus-instance.yaml.j2') }}"
+
+templates/prometheus-instance.yaml.j2
+
 apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
+kind: Prometheus
 metadata:
-  name: custom-node-exporter-sm
-  namespace: my-user-monitoring
+  name: user-prometheus
+  namespace: {{ monitoring_namespace }}
 spec:
-  selector:
+  replicas: 1
+  serviceAccountName: prometheus-user
+  serviceMonitorSelector:
     matchLabels:
-      app: custom-node-exporter
-  endpoints:
-    - port: metrics
-      interval: 30s
-  namespaceSelector:
-    matchNames:
-      - my-user-monitoring
-Key Points:
+      user-monitoring: \"true\"
+  remoteWrite:
+    - url: "{{ remote_write.url }}"
+      basicAuth:
+        username:
+          name: prometheus-remote-write-secret
+          key: username
+        password:
+          name: prometheus-remote-write-secret
+          key: password
 
-The selector under spec.selector.matchLabels must match the labels on the Service (and in turn, the DaemonSet pods).
+tasks/servicemonitors.yaml
 
-The user-workload Prometheus typically scrapes any ServiceMonitor in any user namespace (unless restricted). If you place it in the same namespace as the DaemonSet, everything is straightforward.
+- name: Create ServiceMonitors for kube-state-metrics and node-exporter
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: kube-state-metrics-monitor
+        labels:
+          user-monitoring: "true"
+      spec:
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: kube-state-metrics
+        endpoints:
+          - port: http-metrics
+            interval: 30s
 
-4. Remote Write to Central Cluster
-Once user-workload Prometheus is scraping the custom Node Exporter, you can remote write those metrics to your central Prometheus (or Observability cluster) by adding a remoteWrite: section to the user-workload-monitoring-config in openshift-user-workload-monitoring. For example:
+- name: Create Node Exporter ServiceMonitor
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: node-exporter-monitor
+        labels:
+          user-monitoring: "true"
+      spec:
+        selector:
+          matchLabels:
+            app: node-exporter
+        endpoints:
+          - port: metrics
+            interval: 30s
 
-yaml
-Copy
-Edit
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: user-workload-monitoring-config
-  namespace: openshift-user-workload-monitoring
-data:
-  config.yaml: |
-    prometheus:
-      remoteWrite:
-        - url: "https://central-prom.example.com/api/v1/write"
-          bearer_token: "mySecret"
+Additional Steps:
+
+Create the Kubernetes secret (prometheus-remote-write-secret) separately to store credentials securely.
+
+
+You can directly integrate this Ansible role into your automation workflow to reliably deploy the entire monitoring stack on OpenShift.
+
