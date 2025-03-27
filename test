@@ -1,125 +1,211 @@
-Here's how the files can be structured and populated:
+
+
+---
 
 defaults/main.yaml
 
-monitoring_namespace: user-monitoring
+monitoring_namespace: observability
 
 remote_write:
   url: "https://your-remote-prometheus/api/v1/write"
   username: "your_username"
   password: "your_password"
 
-tasks/main.yaml
+kube_state_metrics:
+  name: kube-state-metrics
+  image: quay.io/coreos/kube-state-metrics:v2.10.1
+  port: 8080
 
-- name: Configure User Monitoring Stack
-  include_tasks: "{{ item }}"
-  loop:
-    - namespace.yaml
-    - kube_state_metrics.yaml
-    - node_exporter.yaml
-    - prometheus.yaml
-    - servicemonitors.yaml
+node_exporter:
+  name: node-exporter
+  image: quay.io/prometheus/node-exporter:v1.7.0
+  port: 9100
 
-tasks/namespace.yaml
 
-- name: Create monitoring namespace
-  k8s:
-    api_version: v1
-    kind: Namespace
-    name: "{{ monitoring_namespace }}"
-    state: present
+---
 
-tasks/kube_state_metrics.yaml
+Updated tasks/kube_state_metrics.yaml
 
-- name: Deploy kube-state-metrics
+- name: Deploy kube-state-metrics from template
   k8s:
     state: present
     namespace: "{{ monitoring_namespace }}"
-    src: https://github.com/kubernetes/kube-state-metrics/releases/latest/download/kube-state-metrics.yaml
+    definition: "{{ lookup('template', 'kube-state-metrics.yaml.j2') | from_yaml }}"
 
-tasks/node_exporter.yaml
 
-- name: Deploy Node Exporter DaemonSet
-  k8s:
-    state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('url', 'https://raw.githubusercontent.com/prometheus/node_exporter/master/examples/kubernetes/node-exporter-daemonset.yml', split_lines=False) }}"
+---
 
-tasks/prometheus.yaml
+templates/kube-state-metrics.yaml.j2
 
-- name: Deploy Prometheus instance
-  k8s:
-    state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('template', 'prometheus-instance.yaml.j2') }}"
-
-templates/prometheus-instance.yaml.j2
-
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: user-prometheus
-  namespace: {{ monitoring_namespace }}
+  name: {{ kube_state_metrics.name }}
 spec:
   replicas: 1
-  serviceAccountName: prometheus-user
-  serviceMonitorSelector:
+  selector:
     matchLabels:
-      user-monitoring: \"true\"
-  remoteWrite:
-    - url: "{{ remote_write.url }}"
-      basicAuth:
-        username:
-          name: prometheus-remote-write-secret
-          key: username
-        password:
-          name: prometheus-remote-write-secret
-          key: password
+      app: {{ kube_state_metrics.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ kube_state_metrics.name }}
+        app.kubernetes.io/name: kube-state-metrics
+    spec:
+      containers:
+        - name: {{ kube_state_metrics.name }}
+          image: {{ kube_state_metrics.image }}
+          ports:
+            - name: http-metrics
+              containerPort: {{ kube_state_metrics.port }}
 
-tasks/servicemonitors.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ kube_state_metrics.name }}
+  labels:
+    app: {{ kube_state_metrics.name }}
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  ports:
+    - port: {{ kube_state_metrics.port }}
+      name: http-metrics
+      targetPort: http-metrics
+  selector:
+    app: {{ kube_state_metrics.name }}
 
-- name: Create ServiceMonitors for kube-state-metrics and node-exporter
+
+---
+
+Updated tasks/node_exporter.yaml
+
+- name: Deploy node-exporter from template
   k8s:
     state: present
     namespace: "{{ monitoring_namespace }}"
-    definition:
-      apiVersion: monitoring.coreos.com/v1
-      kind: ServiceMonitor
-      metadata:
-        name: kube-state-metrics-monitor
-        labels:
-          user-monitoring: "true"
-      spec:
-        selector:
-          matchLabels:
-            app.kubernetes.io/name: kube-state-metrics
-        endpoints:
-          - port: http-metrics
-            interval: 30s
+    definition: "{{ lookup('template', 'node-exporter.yaml.j2') | from_yaml }}"
 
-- name: Create Node Exporter ServiceMonitor
+
+---
+
+templates/node-exporter.yaml.j2
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ node_exporter.name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ node_exporter.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ node_exporter.name }}
+    spec:
+      containers:
+        - name: {{ node_exporter.name }}
+          image: {{ node_exporter.image }}
+          ports:
+            - containerPort: {{ node_exporter.port }}
+              name: metrics
+          args:
+            - "--path.procfs=/host/proc"
+            - "--path.sysfs=/host/sys"
+            - "--path.rootfs=/host/root"
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ node_exporter.name }}
+  labels:
+    app: {{ node_exporter.name }}
+spec:
+  selector:
+    app: {{ node_exporter.name }}
+  ports:
+    - name: metrics
+      port: {{ node_exporter.port }}
+      targetPort: metrics
+
+
+---
+
+Updated tasks/servicemonitors.yaml
+
+- name: Deploy kube-state-metrics ServiceMonitor
   k8s:
     state: present
     namespace: "{{ monitoring_namespace }}"
-    definition:
-      apiVersion: monitoring.coreos.com/v1
-      kind: ServiceMonitor
-      metadata:
-        name: node-exporter-monitor
-        labels:
-          user-monitoring: "true"
-      spec:
-        selector:
-          matchLabels:
-            app: node-exporter
-        endpoints:
-          - port: metrics
-            interval: 30s
+    definition: "{{ lookup('template', 'servicemonitor-ksm.yaml.j2') | from_yaml }}"
 
-Additional Steps:
-
-Create the Kubernetes secret (prometheus-remote-write-secret) separately to store credentials securely.
+- name: Deploy node-exporter ServiceMonitor
+  k8s:
+    state: present
+    namespace: "{{ monitoring_namespace }}"
+    definition: "{{ lookup('template', 'servicemonitor-node-exporter.yaml.j2') | from_yaml }}"
 
 
-You can directly integrate this Ansible role into your automation workflow to reliably deploy the entire monitoring stack on OpenShift.
+---
+
+templates/servicemonitor-ksm.yaml.j2
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ kube_state_metrics.name }}-monitor
+  labels:
+    app.k8s: user-monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  endpoints:
+    - port: http-metrics
+      interval: 30s
+
+
+---
+
+templates/servicemonitor-node-exporter.yaml.j2
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ node_exporter.name }}-monitor
+  labels:
+    app.k8s: user-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: {{ node_exporter.name }}
+  endpoints:
+    - port: metrics
+      interval: 30s
+
+
+---
+
+
 
