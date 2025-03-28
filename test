@@ -1,147 +1,123 @@
-📌 Variables (defaults/main.yaml):
-
-
-remote_write_url: "https://your-remote-prometheus/api/v1/write"
-📌 Entry Task (tasks/main.yaml):
-- name: Create namespace
-  import_tasks: namespace.yaml
-
-- name: Setup RBAC permissions
-  import_tasks: rbac.yaml
-
-- name: Deploy Prometheus Operator
-  import_tasks: prometheus-operator.yaml
-
-- name: Deploy Prometheus instance
-  import_tasks: prometheus-instance.yaml
-
-- name: Deploy node-exporter
-  import_tasks: node-exporter.yaml
-
-- name: Deploy kube-state-metrics
-  import_tasks: kube-state-metrics.yaml
-
-- name: Deploy ServiceMonitors
-  import_tasks: servicemonitors.yaml
-📌 Namespace (tasks/namespace.yaml):
-- name: Create observability namespace
-  k8s:
-    api_version: v1
-    kind: Namespace
-    name: "{{ namespace }}"
-    state: present
-📌 RBAC (tasks/rbac.yaml):
-- name: Create ServiceAccount
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition:
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: prometheus-user
-
-- name: Create Role and RoleBinding
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: Role
-      metadata:
-        name: prometheus-reader
-      rules:
-      - apiGroups: [""]
-        resources: ["pods", "services", "endpoints", "nodes", "namespaces"]
-        verbs: ["get", "list", "watch"]
-
-- name: Bind Role to ServiceAccount
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: RoleBinding
-      metadata:
-        name: prometheus-reader-binding
-      subjects:
-      - kind: ServiceAccount
-        name: prometheus-user
-      roleRef:
-        kind: Role
-        name: prometheus-reader
-        apiGroup: rbac.authorization.k8s.io
-📌 Prometheus Operator (tasks/prometheus-operator.yaml):
-- name: Deploy Prometheus Operator
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition: "{{ lookup('url', 'https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.72.0/bundle.yaml') | from_yaml_all }}"
-📌 Prometheus Instance (tasks/prometheus-instance.yaml):
-- name: Deploy Prometheus Instance
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition: "{{ lookup('template', 'prometheus-instance.yaml.j2') | from_yaml }}"
-📌 Template (templates/prometheus-instance.yaml.j2):
-apiVersion: monitoring.coreos.com/v1
-kind: Prometheus
+templates/operatorgroup.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
 metadata:
-  name: prometheus
-  namespace: {{ namespace }}
+  name: observability-operator-group
+  namespace: "{{ monitoring_namespace }}"
+spec:
+  targetNamespaces:
+    - "{{ monitoring_namespace }}"
+templates/subscription.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-observability-operator
+  namespace: "{{ monitoring_namespace }}"
+spec:
+  channel: stable
+  name: cluster-observability-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+templates/remote-write-secret.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prometheus-remote-write-secret
+  namespace: "{{ monitoring_namespace }}"
+stringData:
+  username: "{{ remote_write.username }}"
+  password: "{{ remote_write.password }}"
+templates/kube-state-metrics.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ kube_state_metrics.name }}"
+  namespace: "{{ monitoring_namespace }}"
+  labels:
+    app: "{{ kube_state_metrics.name }}"
 spec:
   replicas: 1
-  serviceAccountName: prometheus-user
-  serviceMonitorSelector: {}
-  remoteWrite:
-    - url: "{{ remote_write_url }}"
-📌 Node Exporter (tasks/node-exporter.yaml):
-- name: Deploy node-exporter
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition: "{{ lookup('template', 'node-exporter.yaml.j2') | from_yaml_all }}"
-📌 Template (templates/node-exporter.yaml.j2):
-Use the official node-exporter DaemonSet YAML (make sure to adapt for OpenShift SCC if required.)
-
-📌 kube-state-metrics (tasks/kube-state-metrics.yaml):
-- name: Deploy kube-state-metrics
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition: "{{ lookup('template', 'kube-state-metrics.yaml.j2') | from_yaml_all }}"
-📌 Template (templates/kube-state-metrics.yaml.j2):
-Official kube-state-metrics YAML
-
-📌 ServiceMonitors (tasks/servicemonitors.yaml):
-- name: Deploy ServiceMonitors
-  k8s:
-    state: present
-    namespace: "{{ namespace }}"
-    definition: "{{ lookup('template', 'servicemonitors.yaml.j2') | from_yaml_all }}"
-📌 Template (templates/servicemonitors.yaml.j2):
----
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: node-exporter-monitor
-spec:
   selector:
     matchLabels:
-      app: node-exporter
-  endpoints:
-  - port: metrics
-    interval: 30s
+      app: "{{ kube_state_metrics.name }}"
+  template:
+    metadata:
+      labels:
+        app: "{{ kube_state_metrics.name }}"
+        app.kubernetes.io/name: kube-state-metrics
+    spec:
+      containers:
+        - name: kube-state-metrics
+          image: "{{ kube_state_metrics.image }}"
+          ports:
+            - name: http-metrics
+              containerPort: "{{ kube_state_metrics.port }}"
 
 ---
-apiVersion: monitoring.coreos.com/v1
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{{ kube_state_metrics.name }}"
+  namespace: "{{ monitoring_namespace }}"
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  ports:
+    - port: "{{ kube_state_metrics.port }}"
+      name: http-metrics
+      targetPort: http-metrics
+  selector:
+    app: "{{ kube_state_metrics.name }}"
+templates/prometheus-instance.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: monitoring.rhobs/v1
+kind: MonitoringStack
+metadata:
+  name: user-monitoring-stack
+  namespace: "{{ monitoring_namespace }}"
+spec:
+  retention: 24h
+  logLevel: info
+  remoteWrite:
+    - url: "{{ remote_write.url }}"
+      basicAuth:
+        username:
+          name: prometheus-remote-write-secret
+          key: username
+        password:
+          name: prometheus-remote-write-secret
+          key: password
+Note: MonitoringStack is used here for compatibility with Cluster Observability Operator.
+
+templates/kube-state-servicemonitor.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: monitoring.rhobs/v1
 kind: ServiceMonitor
 metadata:
   name: kube-state-metrics-monitor
+  namespace: "{{ monitoring_namespace }}"
+  labels:
+    monitoring-stack: user-monitoring-stack
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: kube-state-metrics
   endpoints:
-  - port: http-metrics
-    interval: 30s
+    - port: http-metrics
+      interval: 30s
