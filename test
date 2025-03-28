@@ -1,211 +1,147 @@
+📌 Variables (defaults/main.yaml):
 
 
----
+remote_write_url: "https://your-remote-prometheus/api/v1/write"
+📌 Entry Task (tasks/main.yaml):
+- name: Create namespace
+  import_tasks: namespace.yaml
 
-defaults/main.yaml
+- name: Setup RBAC permissions
+  import_tasks: rbac.yaml
 
-monitoring_namespace: observability
+- name: Deploy Prometheus Operator
+  import_tasks: prometheus-operator.yaml
 
-remote_write:
-  url: "https://your-remote-prometheus/api/v1/write"
-  username: "your_username"
-  password: "your_password"
+- name: Deploy Prometheus instance
+  import_tasks: prometheus-instance.yaml
 
-kube_state_metrics:
-  name: kube-state-metrics
-  image: quay.io/coreos/kube-state-metrics:v2.10.1
-  port: 8080
+- name: Deploy node-exporter
+  import_tasks: node-exporter.yaml
 
-node_exporter:
-  name: node-exporter
-  image: quay.io/prometheus/node-exporter:v1.7.0
-  port: 9100
+- name: Deploy kube-state-metrics
+  import_tasks: kube-state-metrics.yaml
 
-
----
-
-Updated tasks/kube_state_metrics.yaml
-
-- name: Deploy kube-state-metrics from template
+- name: Deploy ServiceMonitors
+  import_tasks: servicemonitors.yaml
+📌 Namespace (tasks/namespace.yaml):
+- name: Create observability namespace
+  k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ namespace }}"
+    state: present
+📌 RBAC (tasks/rbac.yaml):
+- name: Create ServiceAccount
   k8s:
     state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('template', 'kube-state-metrics.yaml.j2') | from_yaml }}"
+    namespace: "{{ namespace }}"
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: prometheus-user
 
+- name: Create Role and RoleBinding
+  k8s:
+    state: present
+    namespace: "{{ namespace }}"
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: prometheus-reader
+      rules:
+      - apiGroups: [""]
+        resources: ["pods", "services", "endpoints", "nodes", "namespaces"]
+        verbs: ["get", "list", "watch"]
 
----
-
-templates/kube-state-metrics.yaml.j2
-
-apiVersion: apps/v1
-kind: Deployment
+- name: Bind Role to ServiceAccount
+  k8s:
+    state: present
+    namespace: "{{ namespace }}"
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: prometheus-reader-binding
+      subjects:
+      - kind: ServiceAccount
+        name: prometheus-user
+      roleRef:
+        kind: Role
+        name: prometheus-reader
+        apiGroup: rbac.authorization.k8s.io
+📌 Prometheus Operator (tasks/prometheus-operator.yaml):
+- name: Deploy Prometheus Operator
+  k8s:
+    state: present
+    namespace: "{{ namespace }}"
+    definition: "{{ lookup('url', 'https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.72.0/bundle.yaml') | from_yaml_all }}"
+📌 Prometheus Instance (tasks/prometheus-instance.yaml):
+- name: Deploy Prometheus Instance
+  k8s:
+    state: present
+    namespace: "{{ namespace }}"
+    definition: "{{ lookup('template', 'prometheus-instance.yaml.j2') | from_yaml }}"
+📌 Template (templates/prometheus-instance.yaml.j2):
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
 metadata:
-  name: {{ kube_state_metrics.name }}
+  name: prometheus
+  namespace: {{ namespace }}
 spec:
   replicas: 1
-  selector:
-    matchLabels:
-      app: {{ kube_state_metrics.name }}
-  template:
-    metadata:
-      labels:
-        app: {{ kube_state_metrics.name }}
-        app.kubernetes.io/name: kube-state-metrics
-    spec:
-      containers:
-        - name: {{ kube_state_metrics.name }}
-          image: {{ kube_state_metrics.image }}
-          ports:
-            - name: http-metrics
-              containerPort: {{ kube_state_metrics.port }}
-
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ kube_state_metrics.name }}
-  labels:
-    app: {{ kube_state_metrics.name }}
-    app.kubernetes.io/name: kube-state-metrics
-spec:
-  ports:
-    - port: {{ kube_state_metrics.port }}
-      name: http-metrics
-      targetPort: http-metrics
-  selector:
-    app: {{ kube_state_metrics.name }}
-
-
----
-
-Updated tasks/node_exporter.yaml
-
-- name: Deploy node-exporter from template
+  serviceAccountName: prometheus-user
+  serviceMonitorSelector: {}
+  remoteWrite:
+    - url: "{{ remote_write_url }}"
+📌 Node Exporter (tasks/node-exporter.yaml):
+- name: Deploy node-exporter
   k8s:
     state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('template', 'node-exporter.yaml.j2') | from_yaml }}"
+    namespace: "{{ namespace }}"
+    definition: "{{ lookup('template', 'node-exporter.yaml.j2') | from_yaml_all }}"
+📌 Template (templates/node-exporter.yaml.j2):
+Use the official node-exporter DaemonSet YAML (make sure to adapt for OpenShift SCC if required.)
 
-
----
-
-templates/node-exporter.yaml.j2
-
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: {{ node_exporter.name }}
-spec:
-  selector:
-    matchLabels:
-      app: {{ node_exporter.name }}
-  template:
-    metadata:
-      labels:
-        app: {{ node_exporter.name }}
-    spec:
-      containers:
-        - name: {{ node_exporter.name }}
-          image: {{ node_exporter.image }}
-          ports:
-            - containerPort: {{ node_exporter.port }}
-              name: metrics
-          args:
-            - "--path.procfs=/host/proc"
-            - "--path.sysfs=/host/sys"
-            - "--path.rootfs=/host/root"
-          volumeMounts:
-            - name: proc
-              mountPath: /host/proc
-              readOnly: true
-            - name: sys
-              mountPath: /host/sys
-              readOnly: true
-            - name: root
-              mountPath: /host/root
-              readOnly: true
-      volumes:
-        - name: proc
-          hostPath:
-            path: /proc
-        - name: sys
-          hostPath:
-            path: /sys
-        - name: root
-          hostPath:
-            path: /
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ node_exporter.name }}
-  labels:
-    app: {{ node_exporter.name }}
-spec:
-  selector:
-    app: {{ node_exporter.name }}
-  ports:
-    - name: metrics
-      port: {{ node_exporter.port }}
-      targetPort: metrics
-
-
----
-
-Updated tasks/servicemonitors.yaml
-
-- name: Deploy kube-state-metrics ServiceMonitor
+📌 kube-state-metrics (tasks/kube-state-metrics.yaml):
+- name: Deploy kube-state-metrics
   k8s:
     state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('template', 'servicemonitor-ksm.yaml.j2') | from_yaml }}"
+    namespace: "{{ namespace }}"
+    definition: "{{ lookup('template', 'kube-state-metrics.yaml.j2') | from_yaml_all }}"
+📌 Template (templates/kube-state-metrics.yaml.j2):
+Official kube-state-metrics YAML
 
-- name: Deploy node-exporter ServiceMonitor
+📌 ServiceMonitors (tasks/servicemonitors.yaml):
+- name: Deploy ServiceMonitors
   k8s:
     state: present
-    namespace: "{{ monitoring_namespace }}"
-    definition: "{{ lookup('template', 'servicemonitor-node-exporter.yaml.j2') | from_yaml }}"
-
-
+    namespace: "{{ namespace }}"
+    definition: "{{ lookup('template', 'servicemonitors.yaml.j2') | from_yaml_all }}"
+📌 Template (templates/servicemonitors.yaml.j2):
 ---
-
-templates/servicemonitor-ksm.yaml.j2
-
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ kube_state_metrics.name }}-monitor
-  labels:
-    app.k8s: user-monitoring
+  name: node-exporter-monitor
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kube-state-metrics-monitor
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: kube-state-metrics
   endpoints:
-    - port: http-metrics
-      interval: 30s
-
-
----
-
-templates/servicemonitor-node-exporter.yaml.j2
-
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: {{ node_exporter.name }}-monitor
-  labels:
-    app.k8s: user-monitoring
-spec:
-  selector:
-    matchLabels:
-      app: {{ node_exporter.name }}
-  endpoints:
-    - port: metrics
-      interval: 30s
-
-
----
-
-
-
+  - port: http-metrics
+    interval: 30s
