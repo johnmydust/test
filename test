@@ -1,4 +1,88 @@
-templates/operatorgroup.yaml.j2
+1. defaults/main.yaml
+yaml
+Copy
+Edit
+monitoring_namespace: observability
+
+remote_write:
+  url: "https://your-remote-prometheus/api/v1/write"
+  username: "your_username"
+  password: "your_password"
+
+kube_state_metrics:
+  name: kube-state-metrics
+  image: quay.io/coreos/kube-state-metrics:v2.10.1
+  port: 8080
+This is where you define your defaults and can override them at runtime if needed.
+
+2. tasks/main.yaml
+yaml
+Copy
+Edit
+- name: Create custom monitoring namespace
+  k8s:
+    definition: "{{ lookup('template', 'namespace.yaml.j2') }}"
+  register: monitoring_ns
+
+- name: Create OperatorGroup (only needed if installing in our custom namespace)
+  k8s:
+    definition: "{{ lookup('template', 'operatorgroup.yaml.j2') }}"
+  when: monitoring_namespace != 'openshift-operators'
+
+- name: Subscribe to Observability Operator via OLM
+  k8s:
+    definition: "{{ lookup('template', 'subscription.yaml.j2') }}"
+  register: subscription_out
+
+- name: Create secret for remote-write credentials
+  k8s:
+    definition: "{{ lookup('template', 'remote-write-secret.yaml.j2') }}"
+
+- name: Deploy kube-state-metrics resources
+  k8s:
+    definition: "{{ lookup('template', 'kube-state-metrics.yaml.j2') }}"
+
+- name: Deploy Prometheus instance (MonitoringStack)
+  k8s:
+    definition: "{{ lookup('template', 'prometheus-instance.yaml.j2') }}"
+  register: monitoringstack_out
+
+- name: Deploy kube-state-metrics ServiceMonitor
+  k8s:
+    definition: "{{ lookup('template', 'kube-state-servicemonitor.yaml.j2') }}"
+
+- name: Deploy node-exporter DaemonSet, Service, and ServiceAccount
+  k8s:
+    definition: "{{ lookup('template', 'node-exporter.yaml.j2') }}"
+  register: node_exporter_out
+
+# OPTIONAL: If you want to automate the SCC assignment too (requires cluster-admin context in Ansible)
+- name: Grant hostaccess SCC to node-exporter ServiceAccount
+  command: >
+    oc adm policy add-scc-to-user hostaccess -z prometheus-node-exporter -n {{ monitoring_namespace }}
+  become: true  # or otherwise ensure you have the privileges
+  args:
+    warn: false
+  changed_when: "'grant hostaccess' in node_exporter_out.stdout"
+Notes:
+
+Some folks prefer to handle the SCC assignment (i.e., oc adm policy add-scc-to-user) outside of Ansible, or in a separate role. If you want to do it from Ansible, you can use the k8s_auth module or a command: task with become: true.
+
+3. templates/namespace.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "{{ monitoring_namespace }}"
+  labels:
+    openshift.io/user-monitoring: "true"
+Note:
+
+openshift.io/user-monitoring: "true" is a label used by user workload monitoring in certain versions of OpenShift. It generally signals that user workloads can be monitored in this namespace.
+
+4. templates/operatorgroup.yaml.j2
 yaml
 Copy
 Edit
@@ -10,7 +94,13 @@ metadata:
 spec:
   targetNamespaces:
     - "{{ monitoring_namespace }}"
-templates/subscription.yaml.j2
+Note:
+
+This file is only needed if you are indeed installing the operator in the custom observability namespace and want OLM to manage it there.
+
+If you were installing in openshift-operators, the namespace likely already has an OperatorGroup.
+
+5. templates/subscription.yaml.j2
 yaml
 Copy
 Edit
@@ -24,7 +114,18 @@ spec:
   name: cluster-observability-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
-templates/remote-write-secret.yaml.j2
+  installPlanApproval: Automatic  # or Manual if you want to approve updates
+Important:
+
+Double-check that spec.name: cluster-observability-operator matches the Package name in the OperatorHub for your OCP 4.18 cluster. You can check by running:
+
+bash
+Copy
+Edit
+oc get packagemanifests -n openshift-marketplace | grep observability
+and see the exact package name.
+
+6. templates/remote-write-secret.yaml.j2
 yaml
 Copy
 Edit
@@ -36,7 +137,11 @@ metadata:
 stringData:
   username: "{{ remote_write.username }}"
   password: "{{ remote_write.password }}"
-templates/kube-state-metrics.yaml.j2
+Using stringData is fine for convenience.
+
+For production, consider using Ansible Vault or an external secret store.
+
+7. templates/kube-state-metrics.yaml.j2
 yaml
 Copy
 Edit
@@ -59,12 +164,11 @@ spec:
         app.kubernetes.io/name: kube-state-metrics
     spec:
       containers:
-        - name: kube-state-metrics
-          image: "{{ kube_state_metrics.image }}"
-          ports:
-            - name: http-metrics
-              containerPort: "{{ kube_state_metrics.port }}"
-
+      - name: kube-state-metrics
+        image: "{{ kube_state_metrics.image }}"
+        ports:
+        - name: http-metrics
+          containerPort: "{{ kube_state_metrics.port }}"
 ---
 apiVersion: v1
 kind: Service
@@ -75,12 +179,16 @@ metadata:
     app.kubernetes.io/name: kube-state-metrics
 spec:
   ports:
-    - port: "{{ kube_state_metrics.port }}"
-      name: http-metrics
-      targetPort: http-metrics
+  - port: "{{ kube_state_metrics.port }}"
+    name: http-metrics
+    targetPort: http-metrics
   selector:
     app: "{{ kube_state_metrics.name }}"
-templates/prometheus-instance.yaml.j2
+Note:
+
+By default, OpenShift’s cluster monitoring stack deploys its own kube-state-metrics. But if you want a separate instance that you control and feed into your custom Prometheus, this is how to do it.
+
+8. templates/prometheus-instance.yaml.j2 (MonitoringStack)
 yaml
 Copy
 Edit
@@ -101,9 +209,13 @@ spec:
         password:
           name: prometheus-remote-write-secret
           key: password
-Note: MonitoringStack is used here for compatibility with Cluster Observability Operator.
+Notes:
 
-templates/kube-state-servicemonitor.yaml.j2
+The Observability Operator will reconcile this CR and stand up a Prometheus for you.
+
+monitoring.rhobs/v1 is correct for the 4.18 Observability Operator. If you see a mismatch, double-check by running oc explain MonitoringStack.
+
+9. templates/kube-state-servicemonitor.yaml.j2
 yaml
 Copy
 Edit
@@ -113,11 +225,127 @@ metadata:
   name: kube-state-metrics-monitor
   namespace: "{{ monitoring_namespace }}"
   labels:
-    monitoring-stack: user-monitoring-stack
+    monitoring-stack: user-monitoring-stack  # Ties it to your MonitoringStack
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: kube-state-metrics
   endpoints:
-    - port: http-metrics
-      interval: 30s
+  - port: http-metrics
+    interval: 30s
+Note:
+
+The monitoring-stack: user-monitoring-stack label is how the Observability Operator’s Prometheus will discover and scrape it.
+
+Make sure the label matches your MonitoringStack name if you changed that.
+
+10. templates/node-exporter.yaml.j2
+yaml
+Copy
+Edit
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: prometheus-node-exporter
+      namespace: "{{ monitoring_namespace }}"
+    # Remember to give this SA the 'hostaccess' SCC:
+    # oc adm policy add-scc-to-user hostaccess -z prometheus-node-exporter -n {{ monitoring_namespace }}
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: prometheus-node-exporter
+      namespace: "{{ monitoring_namespace }}"
+      labels:
+        app: prometheus-node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+    spec:
+      clusterIP: None
+      ports:
+        - name: scrape
+          port: 9100
+          protocol: TCP
+          targetPort: 9100
+      selector:
+        app: prometheus-node-exporter
+
+  - apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: prometheus-node-exporter
+      namespace: "{{ monitoring_namespace }}"
+      labels:
+        app: prometheus-node-exporter
+        role: monitoring
+    spec:
+      selector:
+        matchLabels:
+          app: prometheus-node-exporter
+          role: monitoring
+      updateStrategy:
+        type: RollingUpdate
+      template:
+        metadata:
+          labels:
+            app: prometheus-node-exporter
+            role: monitoring
+        spec:
+          serviceAccountName: prometheus-node-exporter
+          hostNetwork: true
+          hostPID: true
+          containers:
+          - name: node-exporter
+            image: openshift/prometheus-node-exporter:v0.16.0
+            args:
+              - "--path.procfs=/host/proc"
+              - "--path.sysfs=/host/sys"
+            ports:
+              - containerPort: 9100
+                name: scrape
+            resources:
+              requests:
+                memory: 30Mi
+                cpu: 100m
+              limits:
+                memory: 50Mi
+                cpu: 200m
+            volumeMounts:
+              - name: proc
+                mountPath: /host/proc
+                readOnly: true
+              - name: sys
+                mountPath: /host/sys
+                readOnly: true
+          volumes:
+            - name: proc
+              hostPath:
+                path: /proc
+            - name: sys
+              hostPath:
+                path: /sys
+Notes:
+
+Make sure to either create a ServiceMonitor to scrape the node-exporter or annotate the Service in such a way that your user-managed Prometheus picks it up. One approach is a separate ServiceMonitor like this:
+
+yaml
+Copy
+Edit
+apiVersion: monitoring.rhobs/v1
+kind: ServiceMonitor
+metadata:
+  name: node-exporter-servicemonitor
+  namespace: "{{ monitoring_namespace }}"
+  labels:
+    monitoring-stack: user-monitoring-stack
+spec:
+  selector:
+    matchLabels:
+      app: prometheus-node-exporter
+  endpoints:
+  - port: scrape
+    interval: 30s
+Then your custom Prometheus (via MonitoringStack) will discover that service as well.
