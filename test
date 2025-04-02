@@ -1,0 +1,47 @@
+Epic: Implement Cluster Observability Solution
+We are implementing a cluster observability solution to monitor system-level and Kubernetes-level metrics across OpenShift clusters. A proof of concept (PoC) has already been completed — Ansible code is available and deploys observability components into a separate namespace.
+
+The solution includes:
+
+Deploying node-exporters to gather system-level metrics.
+
+Deploying kube-state-metrics.
+
+Sending metrics to a remote write endpoint.
+
+All deployments should be fully automated using Ansible and maintained in GitHub with proper README documentation.
+
+Subtasks / Issues to Create
+Deploy observability components in a separate namespace
+
+Use Ansible to deploy node-exporters and kube-state-metrics on target OpenShift clusters.
+
+Deploy to 10% of clusters (6 clusters) with varying worker node counts for validation.
+
+Enable user-workload monitoring.
+
+Configure and validate remote write setup.
+
+Configure authentication
+
+Set up authentication for both the managed clusters and the remote write receiver.
+
+Deploy remote write receiver with NFS-backed storage
+
+Deploy the receiver on a cluster using NFS server as the data storage backend.
+
+Set up monitoring on this receiver to collect storage usage metrics.
+
+Analyze storage usage over time to evaluate the need for a long-term solution (e.g., Thanos) for historical data retention.
+
+Configure Grafana access and dashboards
+
+Set up Grafana login credentials for team members.
+
+Create a new dashboard to monitor Prometheus receiver data storage usage.
+
+Kubernetes-level metrics collection and dashboard
+
+Gather cluster operator versions and other high-level kube metrics.
+
+Create a Grafana dashboard to visualize this information.
