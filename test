@@ -1,47 +1,271 @@
-Epic: Implement Cluster Observability Solution
-We are implementing a cluster observability solution to monitor system-level and Kubernetes-level metrics across OpenShift clusters. A proof of concept (PoC) has already been completed — Ansible code is available and deploys observability components into a separate namespace.
+Here's a clean and complete Ansible role for deploying your Prometheus remote-write receiver with:
 
-The solution includes:
+Default NFS PersistentVolumeClaim (PVC) storage
 
-Deploying node-exporters to gather system-level metrics.
+OAuth-based authentication (via oauth-proxy sidecar)
 
-Deploying kube-state-metrics.
+Fully templated YAML files for easy customization
 
-Sending metrics to a remote write endpoint.
 
-All deployments should be fully automated using Ansible and maintained in GitHub with proper README documentation.
+Role Structure:
 
-Subtasks / Issues to Create
-Deploy observability components in a separate namespace
+prometheus_receiver/
+├── defaults/
+│   └── main.yml
+├── tasks/
+│   └── main.yml
+├── templates/
+│   ├── prometheus-deployment.yaml.j2
+│   ├── prometheus-config.yaml.j2
+│   ├── prometheus-pvc.yaml.j2
+│   ├── prometheus-rbac.yaml.j2
+│   └── prometheus-service-route.yaml.j2
+└── vars/
+    └── main.yml
 
-Use Ansible to deploy node-exporters and kube-state-metrics on target OpenShift clusters.
 
-Deploy to 10% of clusters (6 clusters) with varying worker node counts for validation.
+---
 
-Enable user-workload monitoring.
+✅ Role Files:
 
-Configure and validate remote write setup.
+📌 defaults/main.yml
 
-Configure authentication
+namespace: prometheus-receiver
+prometheus_image: quay.io/prometheus/prometheus:v2.51.2
+storage_size: 50Gi
+storage_class: ""  # leave blank for default storage class
+oauth_proxy_image: quay.io/openshift/origin-oauth-proxy:latest
 
-Set up authentication for both the managed clusters and the remote write receiver.
 
-Deploy remote write receiver with NFS-backed storage
+---
 
-Deploy the receiver on a cluster using NFS server as the data storage backend.
+📌 tasks/main.yml
 
-Set up monitoring on this receiver to collect storage usage metrics.
+- name: Ensure namespace exists
+  kubernetes.core.k8s:
+    kind: Namespace
+    name: "{{ namespace }}"
+    state: present
 
-Analyze storage usage over time to evaluate the need for a long-term solution (e.g., Thanos) for historical data retention.
+- name: Apply RBAC
+  kubernetes.core.k8s:
+    definition: "{{ lookup('template', 'prometheus-rbac.yaml.j2') }}"
 
-Configure Grafana access and dashboards
+- name: Create PersistentVolumeClaim for Prometheus
+  kubernetes.core.k8s:
+    definition: "{{ lookup('template', 'prometheus-pvc.yaml.j2') }}"
 
-Set up Grafana login credentials for team members.
+- name: Create Prometheus ConfigMap
+  kubernetes.core.k8s:
+    definition: "{{ lookup('template', 'prometheus-config.yaml.j2') }}"
 
-Create a new dashboard to monitor Prometheus receiver data storage usage.
+- name: Deploy Prometheus with OAuth proxy
+  kubernetes.core.k8s:
+    definition: "{{ lookup('template', 'prometheus-deployment.yaml.j2') }}"
 
-Kubernetes-level metrics collection and dashboard
+- name: Deploy Prometheus Service and Route
+  kubernetes.core.k8s:
+    definition: "{{ lookup('template', 'prometheus-service-route.yaml.j2') }}"
 
-Gather cluster operator versions and other high-level kube metrics.
 
-Create a Grafana dashboard to visualize this information.
+---
+
+📌 templates/prometheus-rbac.yaml.j2
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: {{ namespace }}
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: prometheus-view-binding
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: {{ namespace }}
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+
+📌 templates/prometheus-pvc.yaml.j2
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data-pvc
+  namespace: {{ namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ storage_size }}
+  storageClassName: {{ storage_class | default(omit) }}
+
+
+---
+
+📌 templates/prometheus-config.yaml.j2
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{ namespace }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs: []
+
+
+---
+
+📌 templates/prometheus-deployment.yaml.j2
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: {{ namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: {{ prometheus_image }}
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.enable-remote-write-receiver"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+
+        - name: oauth-proxy
+          image: {{ oauth_proxy_image }}
+          args:
+            - "--provider=openshift"
+            - "--https-address=:8443"
+            - "--upstream=http://localhost:9090"
+            - "--openshift-service-account=prometheus"
+            - "--cookie-secret=SECRET" # Replace securely!
+            - "--tls-cert=/etc/tls/private/tls.crt"
+            - "--tls-key=/etc/tls/private/tls.key"
+          ports:
+            - containerPort: 8443
+              name: https
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls/private
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data-pvc
+        - name: tls
+          secret:
+            secretName: prometheus-tls-secret
+
+Note: Before deploying, create the TLS secret:
+
+oc create secret tls prometheus-tls-secret \
+  --cert=tls.crt \
+  --key=tls.key \
+  -n prometheus-receiver
+
+
+---
+
+📌 templates/prometheus-service-route.yaml.j2
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: {{ namespace }}
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - name: https
+    port: 443
+    targetPort: https
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: prometheus
+  namespace: {{ namespace }}
+spec:
+  to:
+    kind: Service
+    name: prometheus
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+
+
+---
+
+✅ Example Playbook (deploy_prometheus.yml):
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  roles:
+    - prometheus_receiver
+
+
+---
+
+✅ How to Run:
+
+Ensure you have required collections installed:
+
+ansible-galaxy collection install kubernetes.core
+
+Then execute the playbook:
+
+ansible-playbook deploy_prometheus.yml
+
+
+---
+
+✅ Summary of what you'll get after running this role:
+
+Prometheus Deployment using NFS (default StorageClass PVC)
+
+OAuth proxy with OpenShift OAuth authentication
+
+Secured HTTPS Route
+
+Easily maintainable and reusable Ansible structure
+
+
+Let me know if you need anything else or assistance deploying!
+
