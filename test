@@ -1,130 +1,57 @@
-You're exactly on the right track! Let me explain this clearly:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: prometheus-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: quay.io/prometheus/prometheus:v2.51.2
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.enable-remote-write-receiver"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
 
-
----
-
-✅ Why you need TLS:
-
-When your remote Prometheus instances send metrics via remote_write to the central Prometheus, communication should ideally be encrypted using HTTPS (TLS), especially if traffic leaves the cluster or crosses networks.
-
-To enable HTTPS, you need a TLS certificate (tls.crt) and a private key (tls.key).
-
-
----
-
-✅ How it works clearly:
-
-Central (receiver) Prometheus:
-
-Uses the tls.crt (public certificate) and tls.key (private key) to enable secure HTTPS traffic via the OAuth proxy.
-
-OpenShift's OAuth proxy will serve HTTPS connections securely with this certificate.
-
-
-Remote (sender) Prometheus instances:
-
-Need to trust the certificate provided by the central Prometheus.
-
-Typically configured with:
-
-insecure_skip_verify: true (quick testing only)
-
-Or provide the CA (tls.crt or CA chain) that signed the central certificate.
-
-
-
-
----
-
-✅ Recommended Secure Setup (Step-by-Step):
-
-🔸 1. Generate a TLS Certificate:
-
-Recommended: Use an internal Certificate Authority (CA) if available.
-
-Quick self-signed for testing (use OpenSSL):
-
-
-openssl req -x509 -newkey rsa:4096 -keyout tls.key -out tls.crt \
--days 365 -nodes \
--subj "/CN=prometheus-receiver.example.com"
-
-Replace prometheus-receiver.example.com with your Prometheus route URL.
-
-
-
----
-
-🔸 2. Create Secret in OpenShift:
-
-Use these files (tls.crt, tls.key) to create a secret:
-
-oc create secret tls prometheus-tls-secret \
-  --cert=tls.crt \
-  --key=tls.key \
-  -n prometheus-receiver
-
-The secret is mounted into OAuth-proxy container, as previously configured:
-
-volumeMounts:
-  - name: tls
-    mountPath: /etc/tls/private
-volumes:
-  - name: tls
-    secret:
-      secretName: prometheus-tls-secret
-
-
----
-
-🔸 3. Configure Remote Clusters to Trust Central Prometheus:
-
-On the remote Prometheus sending metrics, you have two choices:
-
-Option A: Use insecure_skip_verify (easiest, less secure):
-
-remote_write:
-  - url: "https://prometheus-receiver.example.com/api/v1/write"
-    bearer_token: "<token>"
-    tls_config:
-      insecure_skip_verify: true
-
-Option B (Recommended for production): Provide the tls.crt or CA to trust explicitly:
-
-Copy tls.crt to remote Prometheus and configure it:
-
-remote_write:
-  - url: "https://prometheus-receiver.example.com/api/v1/write"
-    bearer_token: "<token>"
-    tls_config:
-      ca_file: "/path/to/tls.crt"
-
-
----
-
-✅ Simple Summary of Files:
-
-
----
-
-✅ Recommended Secure Configuration:
-
-Generate and securely store tls.key (private).
-
-Distribute tls.crt (public) safely to remote clusters.
-
-Avoid using insecure_skip_verify in production environments.
-
-
-
----
-
-✅ Final recommended scenario clearly:
-
-Receiver Prometheus: has TLS secret mounted via OAuth proxy
-
-Remote Prometheus clusters: use bearer token authentication and explicitly trust central Prometheus's certificate (tls.crt)
-
-
-Now you're all set for secure and trusted metric transfer!
-
+        - name: oauth-proxy
+          image: quay.io/openshift/origin-oauth-proxy:latest
+          args:
+            - "--https-address=:8443"
+            - "--provider=openshift"
+            - "--upstream=http://localhost:9090"
+            - "--openshift-service-account=prometheus"
+            - "--openshift-delegate-urls={'/':{'resource':'namespaces','verb':'get'}}"
+            - "--tls-cert=/etc/tls/private/tls.crt"
+            - "--tls-key=/etc/tls/private/tls.key"
+          ports:
+            - containerPort: 8443
+              name: https
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls/private
+      volumes:
+        - name: config-volume
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data-pvc
+        - name: tls
+          secret:
+            secretName: prometheus-tls-secret
