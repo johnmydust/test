@@ -1,104 +1,230 @@
-Ansible Role: Prometheus Remote Write Receiver Deployment (Central Cluster)
+# Ansible Role: Prometheus Remote Write Receiver Deployment (Simplified with OpenShift Route + Basic Auth)
 
-==========================
+# ==========================
+# defaults/main.yml
+# ==========================
+namespace: prometheus_receiver
+storage_class: ""
+storage_size: 50Gi
+prometheus_image: quay.io/prometheus/prometheus:v2.51.2
+basic_auth_username: iamapikey
+basic_auth_password: "{{ iam_token }}"
 
-defaults/main.yml
+# ==========================
+# vars/main.yml
+# ==========================
+receiver_tls_secret_name: prometheus-tls-secret
+receiver_auth_secret_name: prometheus-htpasswd
 
-==========================
+# ==========================
+# tasks/main.yml
+# ==========================
+- name: Create namespace
+  kubernetes.core.k8s:
+    kind: Namespace
+    name: "{{ namespace }}"
+    state: present
 
-namespace: prometheus_receiver storage_class: "" storage_size: 50Gi prometheus_image: quay.io/prometheus/prometheus:v2.51.2 oauth_proxy_image: quay.io/openshift/origin-oauth-proxy:latest cookie_secret: "{{ generated_cookie_secret }}"
+- name: Create Prometheus TLS Secret
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: {{ receiver_tls_secret_name }}
+        namespace: {{ namespace }}
+      type: kubernetes.io/tls
+      data:
+        tls.crt: {{ prometheus_tls_crt }}
+        tls.key: {{ prometheus_tls_key }}
 
-==========================
+- name: Create Prometheus PVC
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: prometheus-data-pvc
+        namespace: {{ namespace }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ storage_size }}
+        {% if storage_class %}storageClassName: {{ storage_class }}{% endif %}
 
-vars/main.yml
+- name: Create Prometheus ConfigMap
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: prometheus-config
+        namespace: {{ namespace }}
+      data:
+        prometheus.yml: |
+          global:
+            scrape_interval: 15s
+          scrape_configs: []
 
-==========================
+- name: Deploy Prometheus
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: prometheus
+        namespace: {{ namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: prometheus
+        template:
+          metadata:
+            labels:
+              app: prometheus
+          spec:
+            containers:
+              - name: prometheus
+                image: {{ prometheus_image }}
+                args:
+                  - --config.file=/etc/prometheus/prometheus.yml
+                  - --storage.tsdb.path=/prometheus
+                  - --web.enable-remote-write-receiver
+                  - --web.route-prefix=/
+                  - --web.config.file=/etc/prometheus/web-config.yml
+                ports:
+                  - containerPort: 9090
+                volumeMounts:
+                  - name: config-volume
+                    mountPath: /etc/prometheus
+                  - name: data
+                    mountPath: /prometheus
+            volumes:
+              - name: config-volume
+                projected:
+                  sources:
+                    - configMap:
+                        name: prometheus-config
+                    - secret:
+                        name: prometheus-web-config
+              - name: data
+                persistentVolumeClaim:
+                  claimName: prometheus-data-pvc
 
-receiver_tls_secret_name: prometheus-tls-secret receiver_token_secret_name: remote-writer-token
+- name: Create basic auth credentials file (htpasswd)
+  ansible.builtin.command:
+    cmd: htpasswd -nb {{ basic_auth_username }} {{ basic_auth_password }}
+  register: htpasswd_output
+  changed_when: false
 
-==========================
+- name: Create Secret for web-config.yml with basic auth
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: prometheus-web-config
+        namespace: {{ namespace }}
+      type: Opaque
+      stringData:
+        web-config.yml: |
+          basic_auth_users:
+            {{ basic_auth_username }}: {{ htpasswd_output.stdout.split(':')[1] }}
 
-tasks/main.yml
+- name: Create Prometheus Service
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: prometheus
+        namespace: {{ namespace }}
+      spec:
+        selector:
+          app: prometheus
+        ports:
+          - port: 443
+            targetPort: 9090
+            name: web
 
-==========================
+- name: Create OpenShift Route
+  kubernetes.core.k8s:
+    definition: |
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: prometheus
+        namespace: {{ namespace }}
+      spec:
+        to:
+          kind: Service
+          name: prometheus
+        tls:
+          termination: edge
+        port:
+          targetPort: web
 
-name: Create namespace kubernetes.core.k8s: kind: Namespace name: "{{ namespace }}" state: present
+# ==========================
+# Remote Cluster Manual Configuration
+# ==========================
+# 1. Create secret:
+# oc create secret generic remote-write-auth \
+#   --from-literal=username=iamapikey \
+#   --from-literal=password=<password> \
+#   -n openshift-user-workload-monitoring
 
-name: Create Prometheus ServiceAccount kubernetes.core.k8s: definition: | apiVersion: v1 kind: ServiceAccount metadata: name: prometheus namespace: {{ namespace }}
+# 2. Label secret:
+# oc label secret remote-write-auth prometheus.openshift.io/remote-write=true -n openshift-user-workload-monitoring
 
-name: Bind ServiceAccount to system:auth-delegator kubernetes.core.k8s: definition: | apiVersion: rbac.authorization.k8s.io/v1 kind: ClusterRoleBinding metadata: name: prometheus-auth-delegator roleRef: kind: ClusterRole name: system:auth-delegator apiGroup: rbac.authorization.k8s.io subjects: - kind: ServiceAccount name: prometheus namespace: {{ namespace }}
-
-name: Create bearer token for remote writers kubernetes.core.k8s: definition: | apiVersion: v1 kind: ServiceAccount metadata: name: remote-writer namespace: {{ namespace }}
-
-
-
----
-
-apiVersion: v1
-  kind: Secret
-  metadata:
-    name: {{ receiver_token_secret_name }}
-    namespace: {{ namespace }}
-    annotations:
-      kubernetes.io/service-account.name: remote-writer
-  type: kubernetes.io/service-account-token
-
-name: Create Prometheus TLS Secret kubernetes.core.k8s: definition: | apiVersion: v1 kind: Secret metadata: name: {{ receiver_tls_secret_name }} namespace: {{ namespace }} type: kubernetes.io/tls data: tls.crt: {{ prometheus_tls_crt }} tls.key: {{ prometheus_tls_key }}
-
-name: Create Prometheus PVC kubernetes.core.k8s: definition: | apiVersion: v1 kind: PersistentVolumeClaim metadata: name: prometheus-data-pvc namespace: {{ namespace }} spec: accessModes: - ReadWriteOnce resources: requests: storage: {{ storage_size }} {% if storage_class %}storageClassName: {{ storage_class }}{% endif %}
-
-name: Create Prometheus ConfigMap kubernetes.core.k8s: definition: | apiVersion: v1 kind: ConfigMap metadata: name: prometheus-config namespace: {{ namespace }} data: prometheus.yml: | global: scrape_interval: 15s scrape_configs: []
-
-name: Deploy Prometheus with OAuth Proxy kubernetes.core.k8s: definition: "{{ lookup('template', 'prometheus-deployment.yaml.j2') }}"
-
-name: Create Service and Route kubernetes.core.k8s: definition: "{{ lookup('template', 'prometheus-service-route.yaml.j2') }}"
+# 3. Apply remote write config:
+# cat <<EOF | oc apply -f -
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: user-workload-monitoring-config
+#   namespace: openshift-user-workload-monitoring
+# data:
+#   config.yaml: |
+#     prometheus:
+#       remoteWrite:
+#         - url: "https://prometheus-route-url/api/v1/write"
+#           basicAuth:
+#             username: "iamapikey"
+#             passwordFile: /etc/prometheus/secrets/remote-write-auth/password
+#           tlsConfig:
+#             insecureSkipVerify: true
+# EOF
 
 
-==========================
+Done! Your updated Ansible deployment now:
 
-Remote Cluster Manual Configuration
+Removes oauth-proxy complexity
 
-==========================
+Uses native OpenShift Route with TLS termination
 
-oc commands for remote cluster setup:
+Adds built-in Prometheus web.config.yml with basic auth
 
-1. Create token secret:
+Deploys everything via Ansible: namespace, secrets, config, PVC, deployment, service, and route
 
-oc create secret generic remote-write-token --from-literal=token=<generated-token> -n openshift-user-workload-monitoring
 
-2. Label secret for mounting into Prometheus:
+Remote clusters only need:
 
-oc label secret remote-write-token prometheus.openshift.io/remote-write=true -n openshift-user-workload-monitoring
+A secret with credentials
 
-3. Apply ConfigMap:
+A labeled secret for mount
 
-cat <<EOF | oc apply -f -
+A ConfigMap with remoteWrite config using basicAuth
 
-apiVersion: v1
 
-kind: ConfigMap
+Let me know if you'd like:
 
-metadata:
+The remote config as a standalone Ansible role
 
-name: user-workload-monitoring-config
+A web.config.yml template file
 
-namespace: openshift-user-workload-monitoring
+A Grafana config example for secure dashboards from this receiver
 
-data:
-
-config.yaml: |
-
-prometheus:
-
-remoteWrite:
-
-- url: "https://prometheus.apps.receiver-cluster.example.com/api/v1/write"
-
-bearerTokenFile: /etc/prometheus/secrets/remote-write-token/token
-
-tlsConfig:
-
-insecureSkipVerify: true
-
-EOF
 
