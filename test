@@ -1,185 +1,104 @@
-That’s a great question — and the answer depends on a balance between security, manageability, and lifecycle. Let me break it down for you clearly:
+Ansible Role: Prometheus Remote Write Receiver Deployment (Central Cluster)
+
+==========================
+
+defaults/main.yml
+
+==========================
+
+namespace: prometheus_receiver storage_class: "" storage_size: 50Gi prometheus_image: quay.io/prometheus/prometheus:v2.51.2 oauth_proxy_image: quay.io/openshift/origin-oauth-proxy:latest cookie_secret: "{{ generated_cookie_secret }}"
+
+==========================
+
+vars/main.yml
+
+==========================
+
+receiver_tls_secret_name: prometheus-tls-secret receiver_token_secret_name: remote-writer-token
+
+==========================
+
+tasks/main.yml
+
+==========================
+
+name: Create namespace kubernetes.core.k8s: kind: Namespace name: "{{ namespace }}" state: present
+
+name: Create Prometheus ServiceAccount kubernetes.core.k8s: definition: | apiVersion: v1 kind: ServiceAccount metadata: name: prometheus namespace: {{ namespace }}
+
+name: Bind ServiceAccount to system:auth-delegator kubernetes.core.k8s: definition: | apiVersion: rbac.authorization.k8s.io/v1 kind: ClusterRoleBinding metadata: name: prometheus-auth-delegator roleRef: kind: ClusterRole name: system:auth-delegator apiGroup: rbac.authorization.k8s.io subjects: - kind: ServiceAccount name: prometheus namespace: {{ namespace }}
+
+name: Create bearer token for remote writers kubernetes.core.k8s: definition: | apiVersion: v1 kind: ServiceAccount metadata: name: remote-writer namespace: {{ namespace }}
+
 
 
 ---
-
-✅ If you already have an iamapikey with a token stored in your Secrets Manager:
-
-You can absolutely use it — in fact, this is a clean and secure approach as long as:
-
-1. The token is long-lived or renewable
-
-
-2. You have a way to sync it into Kubernetes securely (e.g., via Ansible or a secret-syncing controller)
-
-
-3. The same credentials can be trusted by the receiver cluster
-
-
-
-
----
-
-✅ Recommended Approach: Use the existing iamapikey if:
-
-It’s an organizational credential (like an API key or service identity)
-
-You manage secrets centrally and sync them into clusters
-
-You don’t want the central Prometheus to manage auth identiti
-
-⚠️ Consider creating a new dedicated credential if:
-
-The existing iamapikey is shared among too many systems
-
-You want tighter control over which identities can push metrics
-
-You need to rotate tokens independently
-
-
-A dedicated remote-write identity makes access management, audit, and incident response easier.
-
-
----
-
-✅ Example Setup: Using existing iamapikey (clean and secure)
-
-1. In your Secrets Manager:
-
-username: iamapikey
-
-password: your-secure-token
-
-
-
-2. Inject into Kubernetes Secret (via Ansible or manually):
-
-
 
 apiVersion: v1
-kind: Secret
-metadata:
-  name: remote-write-auth
-  namespace: openshift-user-workload-monitoring
-type: Opaque
-stringData:
-  username: iamapikey
-  password: your-secure-token
+  kind: Secret
+  metadata:
+    name: {{ receiver_token_secret_name }}
+    namespace: {{ namespace }}
+    annotations:
+      kubernetes.io/service-account.name: remote-writer
+  type: kubernetes.io/service-account-token
 
-3. In Prometheus remote_write config:
+name: Create Prometheus TLS Secret kubernetes.core.k8s: definition: | apiVersion: v1 kind: Secret metadata: name: {{ receiver_tls_secret_name }} namespace: {{ namespace }} type: kubernetes.io/tls data: tls.crt: {{ prometheus_tls_crt }} tls.key: {{ prometheus_tls_key }}
 
+name: Create Prometheus PVC kubernetes.core.k8s: definition: | apiVersion: v1 kind: PersistentVolumeClaim metadata: name: prometheus-data-pvc namespace: {{ namespace }} spec: accessModes: - ReadWriteOnce resources: requests: storage: {{ storage_size }} {% if storage_class %}storageClassName: {{ storage_class }}{% endif %}
 
+name: Create Prometheus ConfigMap kubernetes.core.k8s: definition: | apiVersion: v1 kind: ConfigMap metadata: name: prometheus-config namespace: {{ namespace }} data: prometheus.yml: | global: scrape_interval: 15s scrape_configs: []
 
-remote_write:
-  - url: https://central-prom.example.com/api/v1/write
-    basic_auth:
-      username: "iamapikey"
-      password_file: /etc/prometheus/secrets/remote-write-auth/password
-    tls_config:
-      insecure_skip_verify: true
+name: Deploy Prometheus with OAuth Proxy kubernetes.core.k8s: definition: "{{ lookup('template', 'prometheus-deployment.yaml.j2') }}"
 
-4. Label secret for Prometheus to mount:
+name: Create Service and Route kubernetes.core.k8s: definition: "{{ lookup('template', 'prometheus-service-route.yaml.j2') }}"
 
 
+==========================
 
-oc label secret remote-write-auth prometheus.openshift.io/remote-write=true -n openshift-user-workload-monitoring
+Remote Cluster Manual Configuration
 
-5. Configure receiver OAuth Proxy with same iamapikey in an htpasswd !
+==========================
 
+oc commands for remote cluster setup:
 
-Yes — you can absolutely configure username/password authentication for remote write in Prometheus. Since you already have credentials (username: iamapikey, password: <secret>), this is a good and secure approach for machine-to-machine communication.
+1. Create token secret:
 
-Let’s go through the setup clearly and show you the best practice.
+oc create secret generic remote-write-token --from-literal=token=<generated-token> -n openshift-user-workload-monitoring
 
+2. Label secret for mounting into Prometheus:
 
----
+oc label secret remote-write-token prometheus.openshift.io/remote-write=true -n openshift-user-workload-monitoring
 
-✅ 1. Prometheus remote_write supports basic auth
+3. Apply ConfigMap:
 
-On the remote cluster, configure remote_write like this:
-
-remote_write:
-  - url: https://central-prometheus.example.com/api/v1/write
-    basic_auth:
-      username: "iamapikey"
-      password: "your-secret-password"
-    tls_config:
-      insecure_skip_verify: true  # or provide a CA cert
-
-You can also store the password in a secret and mount it, using:
-
-basic_auth:
-  username: "iamapikey"
-  password_file: /etc/prometheus/secrets/api-password/password
-
-
----
-
-✅ 2. Configure central Prometheus to accept basic auth
-
-Since Prometheus does not support authentication natively, you need to add a reverse proxy (like NGINX, oauth-proxy, or traefik) that handles auth in front of Prometheus.
-
-Since you're already using oauth-proxy, here's how you can switch it to use basic auth instead of OpenShift OAuth.
-
-
----
-
-✅ 3. Use oauth-proxy with Basic Auth
-
-Update the OAuth Proxy container args:
-
-args:
-  - "--https-address=:8443"
-  - "--upstream=http://localhost:9090"
-  - "--htpasswd-file=/etc/oauth-proxy/htpasswd"
-  - "--client-id=dummy"
-  - "--client-secret=dummy"
-  - "--cookie-secret={{ cookie_secret }}"
-  - "--tls-cert=/etc/tls/private/tls.crt"
-  - "--tls-key=/etc/tls/private/tls.key"
-
-> You no longer use --provider=openshift or any of the --openshift-* flags. You're switching the proxy to use basic auth from htpasswd.
-
-
-
-
----
-
-✅ 4. Create an htpasswd file
-
-Generate one using htpasswd CLI:
-
-htpasswd -nb iamapikey your-secret-password
-
-This outputs:
-
-iamapikey:$apr1$xxxxxx...
-
-Place this in a Kubernetes secret:
+cat <<EOF | oc apply -f -
 
 apiVersion: v1
-kind: Secret
+
+kind: ConfigMap
+
 metadata:
-  name: prometheus-htpasswd
-  namespace: prometheus-receiver
-type: Opaque
-stringData:
-  htpasswd: |
-    iamapikey:$apr1$xxxxxx...
 
+name: user-workload-monitoring-config
 
----
+namespace: openshift-user-workload-monitoring
 
-✅ 5. Mount the htpasswd secret in the OAuth Proxy
+data:
 
-Add this to the Deployment:
+config.yaml: |
 
-volumeMounts:
-  - name: htpasswd
-    mountPath: /etc/oauth-proxy
-volumes:
-  - name: htpasswd
-    secret:
-      secretName: prometheus-htpasswd
+prometheus:
 
+remoteWrite:
+
+- url: "https://prometheus.apps.receiver-cluster.example.com/api/v1/write"
+
+bearerTokenFile: /etc/prometheus/secrets/remote-write-token/token
+
+tlsConfig:
+
+insecureSkipVerify: true
+
+EOF
 
