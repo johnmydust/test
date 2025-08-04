@@ -1,0 +1,214 @@
+Bazel is an artifact–based build system, not a task–runner like Ant. In Ant a target is free to run arbitrary commands—creating directories, running javac or jar, downloading files, etc.
+bazel.build
+. While powerful, this flexibility means the build tool cannot reason about what your scripts do, which hurts performance and maintainability
+bazel.build
+. To migrate to Bazel you need to decompose the Ant target into deterministic steps with declared inputs and outputs instead of embedding everything in a shell script.
+
+A Bazel‑native approach
+The attached workspace shows how to express the original Ant build target using Bazel rules:
+
+Repository rule for the remote tarball. The WORKSPACE file uses an http_file rule to download the Artifactory tar (fxh_msgstds_<build_id>.tar) during the repository phase. This ensures network access happens once and is cached. Update the url and sha256 attributes to point at your Artifactory instance.
+
+Custom Starlark rule to unpack and filter files. The file msgstds_rules.bzl defines an extract_flows rule. Its implementation uses ctx.actions.run_shell to extract the downloaded tarball, copy only the .esql and .subflow files (excluding .msgflow files) and package them into a new tar archive. Because the input tar is downloaded via http_file, the extraction step runs hermetically without network access
+bazel.build
+.
+
+Java compilation and resources. A standard java_library rule compiles your Java sources and can depend on other JARs via the deps attribute. The extracted flows are declared as data so they are available at runtime. Adjust the srcs, resources and deps globs to match your project.
+
+Root build chain. A filegroup named root_build_chain depends on the extraction and compilation targets. Building this target forces the extraction and compilation to run in sequence. You can add further steps or additional rules as needed.
+
+How to use
+Extract the provided archive into your repository root and update WORKSPACE with the real Artifactory URL and SHA256 checksum.
+
+Adjust the glob patterns in BUILD to match the location of your Java sources and resources, and list any required JARs in the deps section.
+
+Build the whole chain with:
+
+bazel build //ant_to_bazel_native:root_build_chain
+
+# or build individual steps
+bazel build //ant_to_bazel_native:extract_flows
+bazel build //ant_to_bazel_native:msgstds_node
+Because each step declares its inputs and outputs explicitly, Bazel can parallelise independent work, cache intermediate artifacts, and guarantee reproducible builds instead of running an arbitrary script
+bazel.build
+.
+
+
+
+WORKSPACE – defines http_file to fetch the Artifactory tar.
+
+msgstds_rules.bzl – contains the extract_flows Starlark rule.
+
+BUILD – defines filegroup, extract_flows, java_library and the root_build_chain.
+
+This approach uses Bazel’s native mechanisms instead of wrapping the Ant build in a shell script and can be extended to incorporate additional targets or compile steps as your project requires.
+
+
+msgstds_rules.bzl
+def _extract_flows_impl(ctx):
+    """Implementation of extract_flows.
+
+    This action unpacks the given tar archive, copies only `.esql`
+    and `.subflow` files (excluding `.msgflow` files) from the
+    `assembly/subflow/PhysicalTransmissionFlow` subdirectory, and
+    repackages them into a new tar file.  The use of a single output
+    tar archive makes the action deterministic and compatible with
+    Bazel's caching mechanism【455519669977304†L215-L224】.
+    """
+    input_tar = ctx.file.src
+    # Declare the single output tar archive.  The file name is derived
+    # from the target name to avoid collisions.
+    output_tar = ctx.actions.declare_file(ctx.label.name + ".tar")
+
+    # Build a shell script to perform the extraction and repackaging.
+    # The script uses a temporary directory for isolation and ensures
+    # cleanup with a trap.  Only the desired file types are included
+    # in the resulting tar archive.
+    script = """
+set -euo pipefail
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Extract the input tar into the temporary directory
+tar -xf "{input_tar}" -C "$WORK_DIR"
+
+# Source directory containing flows.  Adjust this path if your
+# tarball uses a different layout.
+FLOW_DIR="$WORK_DIR/assembly/subflow/PhysicalTransmissionFlow"
+
+# Directory to collect filtered files
+mkdir -p "$WORK_DIR/filtered"
+
+if [ -d "$FLOW_DIR" ]; then
+  # Copy .esql and .subflow files, excluding any .msgflow files
+  find "$FLOW_DIR" -maxdepth 1 \( -name '*.esql' -o -name '*.subflow' \) \
+      -not -name '*.msgflow' -exec cp {} "$WORK_DIR/filtered" \;
+fi
+
+# Create the output tar from the filtered directory
+tar -cf "{output_tar}" -C "$WORK_DIR/filtered" .
+""".format(
+        input_tar = input_tar.path,
+        output_tar = output_tar.path,
+    )
+
+    # Register the action.  The command is executed by the host's shell.
+    ctx.actions.run_shell(
+        inputs = [input_tar],
+        outputs = [output_tar],
+        command = script,
+        use_default_shell_env = True,
+    )
+
+    return DefaultInfo(files = depset([output_tar]))
+
+
+extract_flows = rule(
+    implementation = _extract_flows_impl,
+    attrs = {
+        "src": attr.label(mandatory = True, allow_single_file = True),
+    },
+    # The rule produces an executable tar archive but is not itself
+    # executable.  Public visibility allows other packages to depend on it.
+    executable = False,
+)
+
+
+
+build 
+"""
+Bazel BUILD file for the StandardsProcessing (msgstds) build.
+
+This file demonstrates how to translate the Ant build into a set of
+Bazel rules without resorting to ad‑hoc shell scripts.  The build is
+structured into three steps:
+
+1. Download the `fxh_msgstds_<build_id>.tar` archive via the
+   `http_file` repository rule in WORKSPACE.  This ensures that
+   network access occurs during the repository phase rather than at
+   action execution time.
+2. Use a custom Starlark rule (`extract_flows`) defined in
+   `msgstds_rules.bzl` to unpack the downloaded tarball, filter the
+   `.esql` and `.subflow` files, and repackage them into a new tar
+   archive.  The rule declares a deterministic output so that Bazel
+   can cache the result and correctly detect when it is up‑to‑date.
+3. Compile Java sources into a jar using the native `java_library`
+   rule, adding the extracted flows as runtime data.  Additional
+   dependencies can be declared via the `deps` attribute.
+
+Finally, the `root_build_chain` filegroup collects the outputs of
+these intermediate targets so that they can be built together with a
+single `bazel build` command.
+"""
+
+load("//:msgstds_rules.bzl", "extract_flows")
+
+# Step 1: reference the downloaded tarball.  The http_file rule
+# publishes its contents under the `@repo_name//file` package.  We
+# wrap it in a filegroup to make the label easier to refer to.
+filegroup(
+    name = "prebuilt_spn_tar",
+    srcs = ["@msgstds_prebuilt_spn//file"],
+    visibility = ["//visibility:private"],
+)
+
+# Step 2: extract and filter the flows using the custom rule.  This
+# produces a tar archive containing only the relevant files.
+extract_flows(
+    name = "extract_flows",
+    src = ":prebuilt_spn_tar",
+    visibility = ["//visibility:public"],
+)
+
+# Step 3: compile Java sources and package them as a jar.  The srcs
+# and resources globs are placeholders; adjust them to match your
+# project layout.  The extract_flows output is listed as data so
+# that it will be available at runtime (for example, if tests need to
+# inspect the flows).  Add Java dependencies to the deps list as
+# appropriate.
+java_library(
+    name = "msgstds_node",
+    srcs = glob(["src/main/java/**/*.java"]),
+    resources = glob(["src/main/resources/**"]),
+    data = [":extract_flows"],
+    deps = [
+        # Add java_import() targets or other java_library() dependencies here
+        # to mirror the `classpath.for.msgstds.node` in the Ant build.
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Root filegroup to build all steps in sequence.  This rule has no
+# outputs of its own but collects the artifacts produced by
+# `extract_flows` and `msgstds_node`.  You can build it with:
+#     bazel build //ant_to_bazel_native:root_build_chain
+# This will ensure that both the flows and the compiled jar are up
+# to date.  You can extend this list with additional targets as
+# needed.
+filegroup(
+    name = "root_build_chain",
+    srcs = [
+        ":extract_flows",
+        ":msgstds_node",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+workspace
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# This WORKSPACE defines the external dependency on the StandardsProcessing
+# node tarball.  The http_file rule downloads the tarball during Bazel's
+# repository phase and exposes it as a file.  Replace the `url` and
+# `sha256` values with the actual Artifactory URL and checksum of your
+# `fxh_msgstds_<build_id>.tar` archive.  Because the download occurs at
+# repository time, the subsequent build rules remain hermetic and do not
+# access the network at execution time.
+http_file(
+    name = "msgstds_prebuilt_spn",
+    url = "https://artifactory.com/fxh_msostds/fxh_msgstds_<build_id>.tar",
+    # TODO: update the sha256 below with the actual checksum of the tarball.
+    sha256 = "<sha256_of_tar>",
+)
+
