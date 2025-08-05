@@ -1,100 +1,24 @@
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
-# Download the external tarball artifact (e.g., from Artifactory)
-# TODO: Replace URL and sha256 with actual values or use variables if needed
+module(name = "msgstd_project", version = "1.0")
+
+bazel_dep(name = "bazel_tools", version = "6.3.0")  # Built-in rules (required)
+
+use_extension("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
 http_file(
     name = "msgstd_tarball",
-    url = "https://artifactory.example.com/path/to/msgstd_artifact.tar.gz",  # TODO: actual tarball URL
-    sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",    # TODO: actual SHA-256
+    url = "https://artifactory.company.com/path/to/fxh_msgstds_123.tar",
+    # Optionally omit this the first time to get an error showing the correct checksum:
+    # sha256 = "your-sha256-here"
 )
 
-# If additional external JARs are required, add them here (e.g., via http_jar or maven_install).
-# Example:
-# http_jar(
-#     name = "some_library",
-#     url = "https://example.com/some_lib.jar",
-#     sha256 = "<sha256>",
-# )
-
-# (Optional) If using pkg_tar from rules_pkg for packaging, include rules_pkg:
-# load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-# RULES_PKG_VERSION = "0.6.0"  # example version
-# http_archive(
-#     name = "rules_pkg",
-#     urls = [f"https://github.com/bazelbuild/rules_pkg/releases/download/{RULES_PKG_VERSION}/rules_pkg-{RULES_PKG_VERSION}.tar.gz"],
-#     sha256 = "<rules_pkg_tarball_sha256>",
-# )
-# load("@rules_pkg//:pkg.bzl", "pkg_tar")
-
-# Custom Bazel rule to extract a tarball and filter out certain files.
-# It extracts only *.esql and *.subflow files from the tarball, excluding any *.msgflow files.
-# Note: Ensure that a 'tar' command is available on the host (runs locally).
-
-def _extract_tar_impl(ctx):
-    tar_file = ctx.file.tar
-    output_dir = ctx.actions.declare_directory("%s_extracted" % ctx.label.name)
-    # Use a shell command to extract and filter the tarball. 
-    # For .tar.gz archives, use -z (gzip). If the artifact is a plain .tar, remove the -z flag.
-    cmd = "rm -rf \"{out}\" && mkdir -p \"{out}\" && tar -xzf \"{tar}\" -C \"{out}\" --wildcards --no-anchored '*.esql' '*.subflow' --exclude='*.msgflow'".format(
-        tar = tar_file.path,
-        out = output_dir.path,
-    )
-    ctx.actions.run_shell(
-        inputs = [tar_file],
-        outputs = [output_dir],
-        command = cmd,
-        execution_requirements = {"local": "1"}  # run locally to ensure system tar is used
-    )
-
-extract_tar = rule(
-    implementation = _extract_tar_impl,
-    attrs = {
-        "tar": attr.label(allow_single_file = True, mandatory = True),
-        # (Optional) Could add attributes for include/exclude patterns or strip_prefix if needed
-    },
-)
+use_repo(http_file, "msgstd_tarball")
 
 load("//msgstd:extract_tar.bzl", "extract_tar")
 
-# If the Ant build used external properties for configuration, define those values in WORKSPACE or .bzl files as constants (not needed here explicitly).
-
-# Step 1 & 2: Download tarball (done in WORKSPACE via http_file) and clean directories (not needed in Bazel)
-
-# Step 3: Extract the tarball and filter out files
 extract_tar(
-    name = "extract_dependencies",
-    tar  = "@msgstd_tarball//:file",
-    # The output is a directory containing only the *.esql and *.subflow files (with original paths), no *.msgflow files.
-    visibility = ["//visibility:private"]
+    name = "unpack_msgstd_tar",
+    tar = "@msgstd_tarball//file",
+    visibility = ["//msgstd:__pkg__"],  # 👈 Only visible inside msgstd/
 )
 
-# Step 4: Compile Java source files and package into a JAR
-java_library(
-    name = "msgstd_lib",
-    srcs = glob(["src/main/java/**/*.java"]),          # TODO: adjust glob to actual Java source location
-    resources = glob(["src/main/java/**/*.properties"]),  # Include .properties files as resources
-    deps = [
-        # TODO: Add any required dependencies (external jars or other Bazel targets) here.
-        # e.g., "@some_library//:jar",
-    ],
-    visibility = ["//visibility:public"]
-    # The output JAR (libmsgstd_lib.jar) will contain compiled classes and the resource files.
-)
-
-# Step 5: Post-compilation steps (copying .properties) are handled by including resources in java_library above.
-
-# Step 6: Delete temporary object directory (not needed in Bazel; intermediate outputs are managed by Bazel sandbox)
-
-# Optional: Package the JAR and extracted files into a tarball for distribution or expose files via filegroup.
-# (Using pkg_tar from rules_pkg for packaging, if needed)
-# pkg_tar(
-#     name = "msgstd_bundle",
-#     srcs = [":msgstd_lib"],  # includes the library JAR
-#     # To include the extracted .esql and .subflow files, incorporate them via an intermediate pkg_tar or pkg_filegroup.
-#     # For example, if a separate pkg_tar collected those files, list it under deps.
-#     deps = [
-#         # ":esql_files_tar",  # e.g., a pkg_tar target packaging the .esql and .subflow files
-#     ],
-#     visibility = ["//visibility:public"]
-# )
-
-
+bazel build //msgstd:unpack_msgstd_tar
