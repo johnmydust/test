@@ -1,24 +1,23 @@
-module(name = "msgstd_project", version = "1.0")
 
-bazel_dep(name = "bazel_tools", version = "6.3.0")  # Built-in rules (required)
+def _extract_tar_impl(ctx):
+    out = ctx.actions.declare_directory(ctx.label.name + "_untar")
+    ctx.actions.run_shell(
+        inputs = [ctx.file.tar],
+        outputs = [out],
+        command = """
+            mkdir -p "{out}" && \
+            tar -xf "{tar}" -C "{out}" --wildcards --no-anchored '*.esql' '*.subflow' --exclude='*.msgflow'
+        """.format(
+            tar = ctx.file.tar.path,
+            out = out.path,
+        ),
+        execution_requirements = {"local": "1"},
+    )
+    return [DefaultInfo(files = depset([out]))]
 
-use_extension("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
-
-http_file(
-    name = "msgstd_tarball",
-    url = "https://artifactory.company.com/path/to/fxh_msgstds_123.tar",
-    # Optionally omit this the first time to get an error showing the correct checksum:
-    # sha256 = "your-sha256-here"
+extract_tar = rule(
+    implementation = _extract_tar_impl,
+    attrs = {
+        "tar": attr.label(allow_single_file = True),
+    },
 )
-
-use_repo(http_file, "msgstd_tarball")
-
-load("//msgstd:extract_tar.bzl", "extract_tar")
-
-extract_tar(
-    name = "unpack_msgstd_tar",
-    tar = "@msgstd_tarball//file",
-    visibility = ["//msgstd:__pkg__"],  # 👈 Only visible inside msgstd/
-)
-
-bazel build //msgstd:unpack_msgstd_tar
