@@ -1,23 +1,33 @@
-
-def _extract_tar_impl(ctx):
-    out = ctx.actions.declare_directory(ctx.label.name + "_untar")
-    ctx.actions.run_shell(
-        inputs = [ctx.file.tar],
-        outputs = [out],
-        command = """
-            mkdir -p "{out}" && \
-            tar -xf "{tar}" -C "{out}" --wildcards --no-anchored '*.esql' '*.subflow' --exclude='*.msgflow'
-        """.format(
-            tar = ctx.file.tar.path,
-            out = out.path,
-        ),
-        execution_requirements = {"local": "1"},
-    )
-    return [DefaultInfo(files = depset([out]))]
-
-extract_tar = rule(
-    implementation = _extract_tar_impl,
-    attrs = {
-        "tar": attr.label(allow_single_file = True),
-    },
+# Declare the built-in repo rule from Bazel
+http_archive = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:http.bzl",
+    "http_archive"
 )
+
+# Download + extract the msgstd tarball
+http_archive(
+    name = "msgstd_tarball",
+    urls = ["https://artifactory.company.com/path/to/fxh_msgstds_123.tar"],
+    auth_patterns = {
+        "artifactory.company.com": "Bearer <password>",
+    },
+    # Optional on first run — Bazel will fail and tell you the correct hash
+    # sha256 = "your-sha256-here",
+)
+
+
+
+filegroup(
+    name = "msgstd_resources",
+    srcs = glob(
+        [
+            "@msgstd_tarball//:*.esql",
+            "@msgstd_tarball//:*.subflow",
+        ],
+        exclude = ["@msgstd_tarball//:*.msgflow"],
+    ),
+    visibility = ["//message_node:__pkg__"],
+)
+
+
+bazel build //message_node:msgstd_resources
